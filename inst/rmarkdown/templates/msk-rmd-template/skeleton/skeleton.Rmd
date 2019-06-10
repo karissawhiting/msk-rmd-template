@@ -1,0 +1,31 @@
+---
+title: " "
+author: "Karissa Whiting"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+knit: (function(inputFile, encoding) {
+    rmarkdown::render(inputFile, 
+    output_dir = here::here("outputs"))
+     })
+output:
+  html_document:
+    theme: paper
+    toc: yes
+    toc_float: yes
+fontsize: 12pt
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(here)
+```
+
+```{r}
+load()
+```
+
+

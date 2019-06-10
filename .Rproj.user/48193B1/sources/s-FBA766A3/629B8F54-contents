@@ -1,0 +1,1856 @@
+---
+title: "UC IMPACT Genes & Smoking Analysis"
+author: "Karissa Whiting"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+knit: (function(inputFile, encoding) {
+    rmarkdown::render(inputFile, 
+    output_dir = here::here("outputs"))
+     })
+output:
+  html_document:
+    theme: paper
+    toc: yes
+    toc_float: yes
+fontsize: 12pt
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(here)
+library(readxl)
+library(knitr)
+library(kableExtra)
+#library(biostatR)
+library(survival)
+library(survminer)
+library(glmnet)
+library(broom)
+library(lubridate)
+library(gtsummary)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, warning = FALSE, message = FALSE)
+
+source(here::here("R", "functions.R"))
+load(here::here("data", "impact_uc.RData"))
+```
+
+# Overview of Results
+
+*Note: See Results section "Summary of Gene Results" for details
+
+- Sex, BMI and age at initial consultation (time at which smoking variables were collected) were significantly associated with never vs. ever Smoking Status.
+- KMT2D gene had the strongest signal (higher risk of mutation among smokers) over all smoking metrics. There was an association with never vs. ever, pack years, and cigs per day (categorized). 
+- Some genes showed a signal in both never vs. ever and cig per day (categorized metrics): CHEK2 (fewer mut among smokers), EP300 (more mut among smokers), ERBB3 (more mut among smokers), PIK3CA (fewer mut among smokers), RAF1 (fewer mut among smokers), RXRA (fewer mut among smokers), STK11 (fewer mut among smokers).
+- CREBBP (fewer mut among smokers) showed signal in both smoking exposure, and cpd categorized, but OR direction was not consistent (smoking exposure may not be a reliable metric due to small numbers in some of the groups).
+- CDKN1A and TSC1 are significant in pack years (sqrt) alone, or pack years and cpd, but not across the other smoking metrics. This should be further investigated (potentially look at more non-linear forms of these metrics). 
+- After adjusting for stage, APC (more mut in non smokers) became significant in several metrics. 
+- After adjusting for stage, KMT2D, and other genes that showed signal in unadjusted analysis still show association 
+- TMB is not significantly different between smokers versus non smokers 
+- As a crude "gene signatures" analysis, we tried lasso stability selection with never vs. ever smoked as outcome and full gene matrix as input to determine if genes of interest would surface. CHEK2, RAF1, STK11, PIK3CA, KMT2D, EP300, RB1, APC, CDKN1A, ERBB3 surfaced with highest selection probabiliites, and also were associated in at least one of the other tests (in summary of gene results table). It should be noted that selection probabilities overall were relatively low, indicating a lot of noise in the data set. 
+
+
+# Data & Methods
+
+```{r}
+
+# get earliest sample (there are some ties - should discuss these)
+first_sample <- impact_uc %>%
+  group_by(mrn) %>%
+  arrange(date_of_specimen_collection, .by_group = TRUE) %>%
+  filter(row_number(date_of_specimen_collection) == 1) %>% 
+  ungroup() %>%
+  mutate(age_at_initial_consultation = 
+               as.duration(dob %--% initial_consultation_msk) /
+               dyears(1))
+
+# determine what frequency of mutation must be to consider in analysis. 9 is about 1%
+mutation_frequency_cutoff = 9
+
+# determine what you want p-val cutoff to be for reporting purposes
+pval_cutoff = .1
+```
+- There are `r nrow(impact_uc)` total samples and `r impact_uc %>% select(mrn) %>% unique() %>% nrow` unique patients. 
+- Combined Uter and Urethra primary tumor sites for models due to small group n.
+- Only considered genes with overall prevalence > 9 (approximately 1% of data)
+- Ran logistic regressions with mutation status as outcome for all genes with mutation prevalence > 9 (~ 1% of sample).
+- After running all tests and models on all mutations with prev > 9, any gene that was significantly associated with any one of the smoking metrics with a p-value <= .1 was included in significance tables presented in the results section. 
+- Also analyzed smoking status as outcome and all mutations as predictors using Lasso with stability selection algorithms.
+
+### Genes
+
+```{r, fig.width=9, fig.height=5}
+
+# calc gene alteration frequency and determine thresholds
+
+gene_freq <- first_sample %>%
+  select(mrn, contains("alteration")) %>%
+  gather(key = "gene", value = "alteration", -mrn) %>%
+  group_by(gene) %>%
+  summarise(number_of_alterations = sum(as.numeric(alteration), 
+                                        na.rm = TRUE), 
+            total_genes_tested = sum(alteration != ".")) %>%
+  mutate(prop_alt = number_of_alterations / total_genes_tested) %>%
+  arrange(desc(prop_alt)) 
+  
+gene_freq_plot <- gene_freq %>%
+  mutate(gene = str_remove(gene, "_alteration")) %>%
+  mutate(gene  = fct_reorder(gene, desc(prop_alt))) %>%
+  filter(number_of_alterations != 0) %>%
+  mutate(mut_color = ifelse(number_of_alterations < 9, "not considered",
+                            "included")) 
+
+ggplot(gene_freq_plot, aes(x = gene, y = number_of_alterations)) +
+  geom_bar(stat = "identity", 
+           aes(fill = mut_color)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Frequency of Alterations") +
+  labs(fill = "") +
+  xlab("Gene") + ylab("Number of Alterations")
+  
+# get genes names to include
+over_mut_thresh <- gene_freq %>%
+  filter(number_of_alterations >= mutation_frequency_cutoff) %>% 
+  arrange(desc(number_of_alterations)) %>%
+  pull(gene)
+
+under_mut_thresh <-  gene_freq %>%
+  filter(number_of_alterations <= 9) %>%
+  pull(gene)
+
+```
+
+```{r}
+
+# function to create heatmaps 
+
+# helper function for OR calcs
+or <- function(vec1, vec2) {
+  N00 <- ifelse(vec1 == 0 & vec2 == 0, 1,0) %>% sum()
+  N11 <- ifelse(vec1 == 1 & vec2 == 1, 1,0) %>% sum()
+  N01 <- ifelse(vec1 == 0 & vec2 == 1, 1,0) %>% sum()
+  N10 <- ifelse(vec1 == 1 & vec2 == 0, 1,0) %>% sum()
+  
+  or <- ((N00*N11)/(N01*N10))
+  return(or)
+}
+
+#  function to plot ORs
+plot_gene_ors <- function(alts_df) {
+  
+  names(alts_df) <- str_remove(names(alts_df), "_alteration")
+  res <- map_df(alts_df, function(x) {
+    col = x 
+    ors <- map_df(alts_df, ~or(col, .x)) }) %>%
+  cbind(gene = names(alts_df),.)
+
+#  return(res)
+res_melted <- res %>%
+  gather("pair_gene","odds_ratio",-gene) 
+
+
+
+p <- ggplot(res_melted, aes(gene, pair_gene)) + 
+  geom_tile(aes(fill = log(odds_ratio))) + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  scale_fill_gradient2(low = "darkblue",
+                      midpoint = 0,
+                      high = "red",
+                      na.value = "grey80", 
+                      limits=c(-3,4))
+
+return(p)
+}
+```
+
+```{r, eval=FALSE}
+
+# Plot correlation heatmaps 
+active <- first_sample %>%
+  filter(smoking_status == "Active") %>%
+  select(contains("alteration"))
+
+plot_gene_ors(active) + ggtitle("Active")
+
+former <- first_sample %>%
+  filter(smoking_status == "Former") %>%
+  select(contains("alteration")) 
+
+plot_gene_ors(former) + ggtitle("Former")
+
+
+never <- first_sample %>%
+  filter(smoking_status == "Never") %>%
+  select(contains("alteration")) 
+
+plot_gene_ors(never) + ggtitle("Never")
+```
+
+
+### Smoking Metrics
+
+- Data on the following smoking metrics is available in the data set (not all of these analyzed in this report, but may want to look at more in the future).
+    - Never Smoked vs. Ever Smoked
+    - Never vs. Former vs. Current
+    - Years Since Quitting (cont)
+    - Years Since Quitting (cat, see below for cutpoints)
+    - Smoking Exposure (cat, see below for cutpoints)
+    - Cigarettes Per Day (cont)
+    - Smoking Quantity (cat, see below for cutpoints)
+    - Pack Years (cont, `sqrt(pack years +1)` used in analysis)
+    
+- Binned variables were defined based on (Rink et al. 2013) as follows : 
+    - Smoking Exposure (time and intensity): 
+        - light short term (<=19 CPD and <=19.9 yr), 
+        - light long term ( <= 19 CPD and  >= 20 yr), 
+        - heavy short term ( >= 20 CPD and  <= 19.9 yr), and 
+        - heavy long term ( >= 20 CPD and  >= 20 yr). 
+    - Years Since Quitting
+        - Never Smoked
+        - <= 9.9 Years since quit
+        - `>= 10 Years since quit
+    - Smoking Quantity
+        - Never
+        - <= 19 CPD
+        - `>= 20 CPD
+
+```{r}
+
+# create updated smoking variables
+
+first_sample <- first_sample %>%
+  mutate(smoking_exp = 
+          # create smoking exposure variable
+           case_when(smoking_status == "Never" ~ "Never", 
+                     cigarettes_a_day <= 19 & years_as_smoker <= 19.9 ~ "light, short-term",
+                    cigarettes_a_day <= 19 & years_as_smoker >= 20 ~ "light, long-term", 
+                    cigarettes_a_day >= 20 & years_as_smoker <= 19.9 ~ "heavy, short-term", 
+                    cigarettes_a_day >= 20 & years_as_smoker >= 20 ~ "heavy, long-term"), 
+         # recreate pack years
+         pack_years_calc = (cigarettes_a_day/20) *years_as_smoker, 
+         
+         # smoking quantity categorize
+         smoking_quant = 
+           case_when(smoking_status == "Never" ~ "Never",
+                   cigarettes_a_day <= 19  ~ "<= 19 CPD", 
+                   cigarettes_a_day >= 20 ~ ">= 20 CPD"), 
+         # smoking duration categorize
+         smoking_duration = 
+           case_when(smoking_status == "Never" ~ "Never",
+                   years_as_smoker <= 19  ~ "<= 19 Years", 
+                   years_as_smoker >= 20 ~ ">= 20 Years"), 
+         
+         # years since cess categorize
+         years_cessation = 
+           case_when(smoking_status == "Never" ~ "Never Smoked",
+                   years_since_quitting <= 9.9  ~ "<= 9.9 Years Since Quit", 
+                   years_since_quitting >= 20 ~ ">= 10 Years Since Quit"), 
+         #dichotomized smoking status
+         smoking_status_di = case_when(smoking_status %in% c("Former", "Active") ~ "Smoker", 
+                                       smoking_status %in% "Never" ~ "Non-Smoker")) %>%
+  
+  # relevel for models
+  mutate(smoking_status = fct_relevel(smoking_status, "Never"), 
+         smoking_quant = fct_relevel(smoking_quant, "Never"), 
+         smoking_duration = fct_relevel(smoking_duration, "Never"), 
+         years_cessation = fct_relevel(years_cessation, "Never Smoked"), 
+         smoking_exp = fct_relevel(smoking_exp, "light, short-term", "light, long-term", 
+                                   "heavy, short-term", "heavy, long-term")) %>%
+  filter(mrn != "35554875") # filter out Lorie Brunjes who has incorrect DOB
+           
+
+
+```
+
+```{r, fig.height=3, fig.width=3}
+
+# smoking_status
+first_sample %>%
+  ggplot(., aes(smoking_status)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Smoking Status")
+
+
+# smoking_status
+first_sample %>%
+    filter(!is.na(smoking_status)) %>%
+  ggplot(., aes(tcga_smoker_status)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("TCGA Smoking Status") 
+
+# pack years 
+first_sample %>%
+  filter(smoking_status %in% c("Former", "Active")) %>%
+  ggplot(., aes(x = smoking_status, y = pack_years_calc)) + 
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Distribution of Pack Years \n(Among Smokers)")
+  
+
+# Smoking Cessation
+first_sample %>%
+  ggplot(., aes(years_cessation)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Years Since Quitting") 
+
+# Years since quitting (among former) 
+first_sample %>%
+  filter(smoking_status == "Former") %>%
+  ggplot(., aes(years_since_quitting)) + 
+  geom_bar(stat = "count", binwidth = 3, fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Years Since Quitting \n(Among Former Smokers)")
+
+first_sample %>%
+  ggplot(., aes(smoking_quant)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Smoking Quantity") 
+
+# cigs a day 
+first_sample %>%
+  filter(smoking_status %in% c("Former", "Active")) %>%
+  ggplot(., aes(x = smoking_status, y = cigarettes_a_day)) + 
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Avg. Cigarettes a Day \n(Among Smokers)")
+  
+# smoking duration
+first_sample %>%
+  ggplot(., aes(smoking_duration)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Smoking Duration") 
+
+# years as a smoker
+first_sample %>%
+  filter(smoking_status %in% c("Former", "Active")) %>%
+  ggplot(., aes(x = smoking_status, y = years_as_smoker)) + 
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Years as a Smoker \n(Among Smokers)")
+  
+  
+# age
+first_sample %>%
+  filter(smoking_status %in% c("Former", "Active")) %>%
+  ggplot(., aes(x = smoking_status, y = age_at_initial_consultation)) + 
+  geom_boxplot(fill = "skyblue") +
+  theme_minimal() +
+  ggtitle("Age Distribution \n(Among Smokers)")
+  
+# smoking exposure variable
+first_sample %>%
+#  filter(smoking_status %in% c("Former", "Active")) %>%
+  ggplot(., aes(smoking_exp)) + 
+  geom_histogram(stat = "count", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Derived Smoking Exposure") 
+
+
+
+```
+
+
+```{r }
+
+first_sample <- first_sample %>%
+  mutate(primary_tumor_site = fct_lump(primary_tumor_site, 2, 
+                                       other_level = "Uter/Urethra"))
+  
+first_sample %>%
+  select(smoking_status_di, 
+         sex, 
+         age_at_initial_consultation,
+         ethnicity, 
+         bmi, 
+         pack_years_calc, 
+         years_since_quitting, 
+         years_as_smoker, 
+         cigarettes_a_day,
+         primary_tumor_site, 
+         specimen_classification, 
+         prior_history_of_uc, 
+         disease_classification_at_initial_diagnosis, 
+         prior_treatment,
+         mutational_count, 
+         tmb) %>%
+  filter(!is.na(smoking_status_di)) %>%
+  set_variable_labels(.labels = 
+                        trans_names_to_labs(names(.))) %>%
+  tbl_summary(by = "smoking_status_di") %>%
+  add_overall() %>%
+  add_comparison() %>%
+  tab_style_bold_labels() %>%
+  tab_style_italicize_levels() %>%
+  tab_style_bold_p() %>%
+  as_gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Cohort Characteristics By Smoking Status")
+  
+```
+
+# Results
+
+## Tests of Association 
+
+```{r}
+
+# some alteration cols are numeric some are character, turn all to character and remove "."
+repl_dots_with_na <- function(col) {
+  
+  col_char <- as.character(col)
+  case_when(!(col_char %in% c("0", "1")) ~ NA_character_, 
+             TRUE ~ col_char)
+}
+
+# prepare data set
+
+pr <- first_sample %>%
+  select(tmb, smoking_status, 
+         smoking_status_di, smoking_quant, 
+         pack_years, years_since_quitting, cigarettes_a_day, 
+         smoking_exp, specimen_classification,
+         contains("alteration"))  %>%
+  mutate_at(vars(contains("alteration")), repl_dots_with_na) 
+
+```
+
+
+
+```{r}
+# this vector is the result of all the tests already being run (below)
+
+gene_results <- c("apc",  "braf",  "ccnd1", "cdkn1a", "cdkn2a",
+                  "cdkn2b", "chek2", "crebbp", "ep300", 
+                  "erbb3", "ercc2", "fgf19", "foxp1", "gata3",
+                  "kmt2d", "med12", "pik3ca", "raf1",  "rb1", "rhoa", 
+                  "runx1", "rxra",  "stag2", "stk11", "tsc1")
+
+
+gene_results_alt <- paste0(gene_results, "_alteration")
+
+#adj_gene_results <- c("apc", "chek2", "ep300", "erbb3", "foxp1", "kmt2d",  #"pik3ca", "raf1", "rxra", "stk11", "apc", "chek2", "ep300", "erbb3", "foxp1", # "kmt2d", "pik3ca", "raf1", "rxra", "stk11")
+
+#setdiff(adj_gene_results,gene_results )
+#character(0)
+```
+
+
+### Fisher's Tests: Never/Ever ~ Mutations
+
+```{r}
+
+# Compare characteristics across smoking 
+x <- pr %>%
+  mutate_at(vars(contains("alteration")), as.numeric) %>%
+  select(smoking_status_di, 
+         tmb, 
+         one_of(as.character(over_mut_thresh))) %>%
+  filter(!is.na(smoking_status_di)) %>%
+  set_variable_labels(.labels = 
+                        trans_names_to_labs(names(.))) %>%
+  tbl_summary(by = "smoking_status_di") %>%
+  add_overall() %>%
+  add_comparison(test = 
+                   list(..categorical.. = "fisher.test")) %>%
+  tab_style_bold_labels() %>%
+  tab_style_italicize_levels() %>%
+  tab_style_bold_p() 
+
+# save all associations
+#x$table_body %>%
+#  select(variable, label, stat_0  , stat_1, stat_2, p.value) %>%
+#  filter(row_type == "missing") %>%
+#  write_csv(., path = here::here("outputs", "table-results", "fishers_never_ever.csv"))
+  
+# clean results
+x$table_body <- x$table_body %>% 
+  mutate(variable = str_remove(variable, ("_alteration")))
+
+# get sig genes 
+sig_fish_nevev <- x$table_body %>% 
+  filter(p.value <= pval_cutoff) %>%
+  pull(variable) 
+
+x$table_body <- x$table_body %>% 
+  filter(variable %in% gene_results)
+
+x %>%
+  sort_by_p.tbl_summary() %>%
+  as_gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Mutations By Smoking Status")
+
+# prepare results for results table
+fish_nevev_res_table1 <- x$table_body %>%
+  filter(row_type != "missing") %>%
+  select(variable, p.value) %>%
+  rename("gene" = variable) %>%
+  mutate(variable = "Ever Smoked (Fishers)")
+
+```
+
+### Wilcoxan Rank Sum: Pack Years ~ Mutations (Among Smokers)
+
+```{r}
+# Compare quant smoking characteristics across genes 
+pr_smoke <- pr %>% 
+  # only consider smokers
+  filter(smoking_status_di == "Smoker") 
+
+wilcox_pack_years <- pr_smoke %>%
+  mutate_at(vars(contains("alteration")), as.numeric) %>%
+  
+  # only consider genes over threshold
+  select(one_of(as.character(over_mut_thresh))) %>%
+
+  map2_df(., names(.), function(x, y) {
+    p <- wilcox.test(pr_smoke$pack_years ~ as.numeric(x)) %>%
+      pluck("p.value")
+    
+    mean_0 <- mean(pr_smoke$pack_years[x == 0],
+                   na.rm = TRUE)
+    mean_1 <- mean(pr_smoke$pack_years[x == 1],
+                   na.rm = TRUE)
+    
+    res <- tibble(gene = y, 
+                  mean_no_alteration = mean_0, 
+             mean_alteration = mean_1, 
+             p_value = p)
+    return(res)
+  })   %>%
+  mutate(gene = str_remove_all(gene, "_alteration")) %>%
+  arrange(p_value)
+
+#wilcox_pack_years %>%
+#  write_csv(., path = here::here("outputs", 
+#                                 "table-results", "wilcox_pack_years.csv"))
+
+# get sig genes 
+sig_wilcox_pack_years <- wilcox_pack_years %>% 
+  filter(p_value <= pval_cutoff) %>%
+  pull(gene)
+
+# display results for select genes only 
+wilcox_pack_years %>%
+  filter(gene %in% gene_results) %>%
+  gt() %>%
+  fmt_number(columns = vars(mean_no_alteration,
+                            mean_alteration, 
+                            p_value), 
+             decimals = 3) %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Wilcoxan Stats: Mutation ~ Pack Years (For Select Genes Only, Among Smokers)") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p_value),
+      rows = p_value <= .05)
+  ) %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(gene) 
+  ))
+    
+```
+
+## Gene Viz
+### Plots of Genes of Interest
+
+NOTE: Only some of the selected (sig) genes are displayed below. 
+
+```{r}
+# plots of genes of interest
+
+select_genes <- first_sample %>%
+  select(smoking_status_di,
+         smoking_status, 
+         years_since_quitting, pack_years, cigarettes_a_day, 
+         years_as_smoker,
+         kmt2d_alteration, 
+         pik3ca_alteration, 
+         raf1_alteration, 
+         chek2_alteration, 
+         stk11_alteration, 
+         rxra_alteration, crebbp_alteration, 
+         erbb2_alteration, tsc1_alteration, cdkn1a_alteration)
+
+select_genes %>%
+  filter(smoking_status_di =="Smoker" ) %>% 
+  gather("key", "value", -c(years_since_quitting, 
+                            pack_years, cigarettes_a_day,
+                            smoking_status_di, smoking_status,
+         years_as_smoker)) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = value, 
+                   y = years_as_smoker, 
+                   fill = key)) +
+  facet_wrap(~key) + 
+  theme_minimal() +
+  ggtitle("Years as Smoker (Among Smokers Only)") + 
+  theme(legend.position = "none") 
+
+
+select_genes %>%
+  filter(smoking_status == "Former" ) %>% 
+  gather("key", "value", -c(years_since_quitting, 
+                            pack_years, cigarettes_a_day, 
+         years_as_smoker, smoking_status_di,
+         smoking_status)) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = value, 
+                   y = years_since_quitting, 
+                   fill = key)) +
+  theme_minimal() + 
+  facet_wrap(~key) +
+  ggtitle("Years Since Quitting (Among Former Smokers)") + 
+  theme(legend.position = "none") 
+
+
+select_genes %>%
+  filter(smoking_status_di == "Smoker" ) %>% 
+  gather("key", "value", -c(years_since_quitting, 
+                            pack_years, cigarettes_a_day, 
+         years_as_smoker, smoking_status_di,
+         smoking_status)) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = value, 
+                   y = pack_years, 
+                   fill = key)) +
+  theme_minimal()+ 
+  facet_wrap(~key) +
+  ggtitle("Pack Years (Among Smokers)") + 
+  theme(legend.position = "none") 
+
+select_genes %>%
+  filter(smoking_status_di == "Smoker" ) %>% 
+  gather("key", "value", -c(years_since_quitting, 
+                            pack_years, cigarettes_a_day, 
+         years_as_smoker, smoking_status_di,
+         smoking_status)) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = value, 
+                   y = sqrt(pack_years + 1), 
+                   fill = key)) +
+  theme_minimal() + 
+  facet_wrap(~key) +
+  ggtitle("Sqrt Pack Years (Among Smokers)") + 
+  theme(legend.position = "none") 
+
+
+select_genes %>%
+  filter(smoking_status_di =="Smoker" ) %>% 
+  gather("key", "value", -c(years_since_quitting, 
+                            pack_years, cigarettes_a_day, 
+         years_as_smoker, smoking_status_di,
+         smoking_status)) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = value, 
+                   y = cigarettes_a_day, 
+                   fill = key)) +
+  theme_minimal() + 
+  facet_wrap(~key) +
+  ggtitle("Cigarettes Per Day (Among Smokers)") + 
+  theme(legend.position = "none") 
+```
+
+### Correlations Among Select Genes {.tabset .tabset-fade}
+```{r}
+# Correlation among genes of interest
+select_genes <- first_sample %>%
+  select(smoking_status,
+         one_of(gene_results_alt))
+```
+
+#### Active
+```{r }
+active <- select_genes %>%
+  filter(smoking_status == "Active") %>%
+  select(contains("alteration"))
+
+plot_gene_ors(active) + ggtitle("Active")
+```
+
+#### Former
+
+```{r }
+former <- select_genes %>%
+  filter(smoking_status == "Former") %>%
+  select(contains("alteration")) 
+
+plot_gene_ors(former) + ggtitle("Former")
+```
+
+#### Never
+```{r }
+
+never <- select_genes %>%
+  filter(smoking_status == "Never") %>%
+  select(contains("alteration")) 
+
+plot_gene_ors(never) + ggtitle("Never")
+```
+
+
+## Models: Mutation Status as Outcome
+
+### Mutation ~ Smoking (Ever/Never) Logistic Regression
+
+```{r}
+
+# Never/ Ever OR's
+
+logistic_results <- pr %>%
+  select(one_of(as.character(over_mut_thresh))) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr$smoking_status_di,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+
+logistic_results_clean <- logistic_results %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(desc(or)) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  mutate(variable = "Smoker") %>%
+  select(gene, variable, or, or_upper_ci, 
+         or_lower_ci, n_total, n_mutate, p.value)
+
+# logistic_results_clean  %>%
+#   write_csv(., path = here::here("outputs", "table-results", 
+#                                  "log-reg_smoking-never-ever.csv"))
+#   
+
+sig_never_ever <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+logistic_results_clean <- logistic_results_clean%>%
+  filter(gene %in% gene_results) 
+
+never_ever_results_table1 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value) %>%
+  filter(gene %in% gene_results)
+
+logistic_results_clean %>%
+  arrange(p.value) %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Smoking (Ever/Never); Ref = Never") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+
+```
+
+
+
+```{r fig.height = 5, fig.width = 7}
+
+# Plot Never/Ever ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)),
+                                    color = sig)) + 
+  geom_point(aes(size = n_mutate), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept  = 1 ) +
+  ylab("Genes") +
+  ggtitle("Odds Ratios: Mutation ~ Smoking (Ever/Never)")
+```
+
+
+### Mutation ~ Smoking Quantity (<= 19 CPD, >= 20 CPD, Never)
+```{r}
+
+logistic_results <- pr %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr$smoking_quant,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >= mutation_frequency_cutoff) %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(gene) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  mutate(variable = str_remove(variable, "smoking_quant")) %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+#logistic_results_clean %>%
+#  write_csv(., path = here::here("outputs", "table-results", "log-reg_smoking-quant.csv"))
+
+# get significant genes
+sig_quant <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+logistic_results_clean <- logistic_results_clean%>%
+  filter(gene %in% gene_results) 
+
+quant_results_table1 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value)
+
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Smoking Quantity (<= 19 CPD, >= 20 CPD, Never); Ref = Never") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+```
+
+
+```{r fig.height= 5, fig.width = 8}
+
+# Plot Current/Never/Ever ORs
+
+# Plot Never/Ever ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept  = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ Smoking Quantity")
+```
+
+### Mutation ~ Smoking (Ever/Never) + Stage Logistic Regression 
+
+```{r }
+logistic_results <- pr %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr$smoking_status_di + pr$specimen_classification,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  filter(!str_detect(term, "specimen_classification")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+# clean it up
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >= mutation_frequency_cutoff) %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(gene) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  mutate(variable = str_remove(variable, "smoking_status_di")) %>%
+  mutate(variable = str_remove(variable, "specimen_classification")) %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, 
+         n_mutate, p.value)
+
+# write all results to a csv
+# logistic_results_clean %>%
+#   write_csv(., path = here::here("outputs", 
+#                                  "table-results", "log-reg_smoking-never-ever_stage.csv"))
+  
+# get sig genes
+adj_sig_never_ever <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+# filter only select genes
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+never_ever_results_table2 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value)
+
+# display results 
+logistic_results_clean %>%
+  arrange(p.value) %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Smoking (Ever/Never) + Stage") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+
+```
+
+```{r fig.height=5, fig.width = 8}
+
+
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  filter(variable == "Smoker") %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  ggtitle("Odds Ratios: Mutation ~ Smoking (Ever/Never) + Stage")
+
+```
+
+### Mutation ~ Smoking Quantity (<= 19 CPD, >= 20 CPD, Never) + Stage 
+
+```{r}
+
+logistic_results <- pr %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr$smoking_quant + pr$specimen_classification,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  filter(!str_detect(term, "specimen_classification")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >= mutation_frequency_cutoff) %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(gene) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  mutate(variable = str_remove(variable, "smoking_quant")) %>%
+  mutate(variable = str_remove(variable, "specimen_classification")) %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+# write all result to csv
+# logistic_results_clean %>%
+#   write_csv(., path = here::here("outputs", "table-results", "log-reg_smoking-quant_stage.csv"))
+  
+# get sig genes
+adj_sig_quant_results <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+# filter select genes
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+quant_results_table2 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value)
+
+# display results for select genes
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Smoking Quantity (<= 19 CPD, >= 20 CPD, Never) + Stage") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+```
+
+
+```{r fig.height= 5, fig.width = 8}
+
+# Plot ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  filter(variable %in% c("<= 19 CPD", ">= 20 CPD")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ Smoking Quantity + Stage")
+
+```
+
+### Mutation ~ Continuous Pack Years (Among Smokers Only)
+
+```{r}
+
+# pack years among smokers
+pr_smoke <- pr %>%
+  filter(smoking_status_di == "Smoker")
+
+logistic_results <- pr_smoke %>%
+  filter(smoking_status_di == "Smoker") %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ sqrt(pr_smoke$pack_years + 1),
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  mutate(variable = "pack_years") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >3) %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(desc(or)) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+# write all results to csv
+# logistic_results_clean %>%
+#   write_csv(., path = here::here("outputs", "table-results", "log-reg_pack-years.csv"))
+  
+# get sig gene
+sig_pack_years <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+# filter results for select genes
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+pack_years_results_table1 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value) 
+
+# display results for select genes
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Continuous Pack Years (Among Smokers)") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+```
+
+
+
+
+```{r fig.height= 5, fig.width = 8}
+
+# plot ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ Continuous Pack Years (Among Smokers)")
+
+```
+
+### Mutation ~ Continuous Pack Years (Among Smokers Only) + Stage
+
+```{r}
+
+# pack years among smokers
+pr_smoke <- pr %>%
+  filter(smoking_status_di == "Smoker")
+
+logistic_results <- pr_smoke %>%
+  filter(smoking_status_di == "Smoker") %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ sqrt(pr_smoke$pack_years + 1) + 
+                 pr_smoke$specimen_classification,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  filter(!str_detect(term, "specimen_classification")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  mutate(variable = "pack_years") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >3) %>%
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(desc(or)) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+# write all results to csv
+# logistic_results_clean %>%
+#   write_csv(., path = here::here("outputs", "table-results", "log-reg_pack-years.csv"))
+  
+# get sig gene
+adj_sig_pack_years <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+# filter results for select genes
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+pack_years_results_table2 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value) 
+
+# display results for select genes
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Continuous Pack Years (Among Smokers) + Stage") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+```
+
+
+
+```{r fig.height= 5, fig.width = 8}
+
+# plot ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ Continuous Pack Years (Among Smokers) + Stage")
+
+```
+
+
+### Mutation ~ CPD (Among Smokers)
+
+```{r}
+ # cigarettes a day among smokers
+
+pr_smoke <- pr %>%
+  filter(smoking_status_di == "Smoker") 
+
+logistic_results <- pr_smoke %>%
+  filter(smoking_status_di == "Smoker") %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr_smoke$cigarettes_a_day,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+# clean model results 
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >= 3) %>% # changed to 4 becuase only smokers
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(desc(or)) %>%
+  separate(gene, into = c("gene", NA), sep= "_") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+# write all results to csv
+logistic_results_clean %>%
+  write_csv(., path = here::here("outputs", "table-results", "log-reg_cpd.csv"))
+
+# get significant genes
+sig_cpd <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+  
+# filter select genes to display 
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+cpd_results_table1 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value)
+
+# display results for select genes
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ CPD (Among Smokers)") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+```
+
+```{r fig.height=5, fig.width = 8}
+
+# plot ORs
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                y = factor(gene, levels = unique(gene)))) +
+  geom_point(aes(size = n_mutate, color = sig), 
+             alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ CPD (Among Smokers)")
+
+```
+
+### Mutation ~ Smoking Exposure (Among Smokers)
+
+
+```{r, smoking_exp}
+
+# smoking exposure among smokers
+pr_smoke <- pr %>%
+  filter(smoking_status_di == "Smoker") %>%
+  mutate(smoking_exp = fct_relevel(smoking_exp), "light, short-term")
+
+logistic_results <- pr_smoke %>%
+  filter(smoking_status_di == "Smoker") %>%
+  select(contains("alteration")) %>%
+  map2_df(., names(.), function(x, y) {
+    mod <- glm(as.numeric(x) ~ pr_smoke$smoking_exp,
+      family = binomial(link = "logit"))  
+    
+    mod_res <- mod %>% 
+      tidy() 
+    
+    est_ci <- confint.default(mod) %>%
+      as_tibble(rownames = "term")
+    
+    left_join(mod_res, est_ci, by = "term") %>% 
+      rename("est_lower_ci" = `2.5 %`, 
+             "est_upper_ci" = `97.5 %`) %>%
+      mutate(or = exp(estimate), 
+         or_upper_ci = exp(est_upper_ci), 
+         or_lower_ci = exp(est_lower_ci), 
+         n_total = sum(!is.na(x)),
+         n_mutate = sum(as.numeric(x), na.rm = TRUE),
+         gene = y) %>%
+      return()
+    }) %>%
+  filter(!(term %in% "(Intercept)")) %>%
+  separate(term, into = c(NA, "variable"), sep = "\\$") %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci,
+         estimate, est_upper_ci, est_lower_ci,
+         p.value, n_total, n_mutate)
+
+# clean model results
+logistic_results_clean <- logistic_results %>%
+  filter(n_mutate >= 3) %>% # changed to 4 because only smokers 
+  mutate_if(is.numeric, round, 3) %>% 
+  arrange(gene) %>%
+  separate(gene, into = c("gene", NA), sep= "_")  %>%
+  mutate(variable = str_remove(variable, "smoking_exp")) %>%
+  select(gene, variable, or, or_upper_ci, or_lower_ci, n_total, n_mutate, p.value) 
+
+# write all results to csv
+
+logistic_results_clean %>%
+  write_csv(., path = here::here("outputs", "table-results", "log-reg_smoking-exp.csv"))
+
+# get significant genes
+sig_smoke_exp <- logistic_results_clean %>%
+  filter(p.value <= pval_cutoff) %>%
+  pull(gene)
+
+# filter select genes to display
+logistic_results_clean <- logistic_results_clean %>%
+  filter(gene %in% gene_results) 
+
+# compile results for final table
+smok_exp_results_table1 <- logistic_results_clean %>%
+  select(gene, variable, or, p.value) 
+
+# display results for select genes
+logistic_results_clean %>%
+  group_by(gene) %>%
+  mutate(min_p = min(p.value)) %>%
+  arrange(min_p) %>%
+  select(-min_p) %>%
+  ungroup() %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Odds Ratios: Mutation ~ Smoking Exp (Among Smokers); Ref = light, short-term") %>%
+  tab_style(
+    style = cells_styles(text_weight = "bold"),
+    locations = cells_data(
+      columns = vars(p.value),
+      rows = p.value <= .05)
+  ) 
+
+
+```
+
+```{r fig.height= 5, fig.width = 8}
+
+# plot ORs 
+logistic_results_clean %>%
+  mutate(sig = ifelse(p.value < .05, "significant", "not significant")) %>%
+  ggplot(., aes(x = or, 
+                      y = factor(gene, 
+                                 levels = unique(gene)))) + 
+  geom_point(aes(size = n_mutate, color = sig), alpha = .6) +
+  geom_segment(aes(x = or_lower_ci, y = gene,
+                   xend = or_upper_ci, yend = gene, color = sig)) +
+  geom_text(aes(label=p.value),hjust=-2, vjust=0, size = 2) +
+  theme_minimal() +
+  geom_vline(xintercept = 1 ) +
+  ylab("Genes") +
+  facet_wrap(~variable) +
+  ggtitle("Odds Ratios: Mutation ~ Smoking Exp (Among Smokers)")
+
+```
+
+## Summary of Gene Results
+
+```{r}
+
+
+# get final list of select genes (this is used above in various places)
+x <- ls()
+all_sig_obj <- x[map_lgl(x, ~str_detect(.x, "sig"))]
+gene_results <- map(all_sig_obj, ~eval(parse(text = .x))) %>% 
+  unlist %>% 
+  unique()
+
+```
+
+```{r not adjusted results table}
+
+all_tab1_obj <- x[map_lgl(x, ~str_detect(.x, "table1"))]
+
+fish_nevev_res_table1 <- 
+  fish_nevev_res_table1 %>%
+  mutate(analysis = "fisher", 
+         variable = "ever smoked (fisher)")
+
+never_ever_results_table1 <- 
+  never_ever_results_table1 %>%
+  mutate(analysis = "logreg", 
+         variable = "ever smoked")
+
+quant_results_table1 <- 
+  quant_results_table1 %>%
+  mutate(analysis = "logreg")
+
+pack_years_results_table1 <- 
+  pack_years_results_table1 %>%
+  mutate(analysis = "logreg", 
+         variable = "pack years")
+
+cpd_results_table1 <- 
+  cpd_results_table1 %>%
+  mutate(analysis = "logreg",
+         variable = "cig per day")
+
+smok_exp_results_table1 <- smok_exp_results_table1 %>%
+  mutate(analysis = "logreg")
+
+results <- bind_rows(fish_nevev_res_table1,
+                     never_ever_results_table1,
+                     quant_results_table1,
+                     pack_years_results_table1, 
+                     cpd_results_table1, 
+                     smok_exp_results_table1) %>%
+  select(-or)
+```
+
+
+
+```{r }
+results_sp <- results %>%
+  select(variable, gene, p.value) %>%
+  spread(key = variable, value = p.value) %>%
+  
+  #re-order columns for display 
+  select(gene, `ever smoked (fisher)`, `ever smoked`, 
+         `light, long-term`, `heavy, short-term`,
+         `heavy, long-term`, `<= 19 CPD`, 
+         `>= 20 CPD`, `cig per day`, `pack years`) 
+
+vars_color = names(results_sp)[-1]
+
+results_sp %>%
+  mutate(gene = toupper(gene)) %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    heading.title.font.size = "small",
+    column_labels.font.size = "small",
+    heading.subtitle.font.size = "small",
+    row.padding = px(1)) %>%
+#  tab_header("") %>%
+  data_color(
+    columns = one_of(vars_color),
+    colors = scales::col_numeric(
+      palette = rev(paletteer::paletteer_d(
+        package = "ggsci",
+        palette = "deep-purple_material"
+        )),
+      domain = c(0, .1))
+  ) %>%
+  fmt_number(columns = one_of(vars_color), 
+             decimals = 3) %>%
+  tab_spanner(
+    label = "LogReg CPD (cat)",
+    columns = vars(
+      `<= 19 CPD`, 
+      `>= 20 CPD`)) %>%
+  tab_spanner( 
+    label = "LogReg CPD (cont)", 
+    columns = vars(`cig per day`)
+  ) %>%
+  tab_spanner( 
+    label = "Fisher Test", 
+    columns = vars(`ever smoked (fisher)`)
+  ) %>%
+    tab_spanner( 
+    label = "LogReg Ever/Never", 
+    columns = vars(`ever smoked`)
+  ) %>%
+    tab_spanner( 
+    label = "LogReg Smoking Exp", 
+    columns = vars(`heavy, long-term`,
+                   `heavy, short-term`, 
+                   `light, long-term`)) %>%
+  tab_spanner(
+        label = "LogReg Pack-Years", 
+    columns = vars(`pack years`)
+ ) %>%
+  tab_header("P-Values for Unadjusted Smoking Metrics")
+
+
+```
+
+
+```{r stage adjusted results table}
+
+never_ever_results_table2 <- 
+  never_ever_results_table2 %>%
+  mutate(analysis = "logreg") %>%
+  mutate(variable = "ever smoked")
+
+quant_results_table2 <- 
+  quant_results_table2 %>%
+  mutate(analysis = "logreg")
+
+pack_years_results_table2 <- 
+  pack_years_results_table2 %>%
+  mutate(analysis = "logreg", 
+         variable = "pack years")
+
+adj_results <- bind_rows(never_ever_results_table2, 
+                         quant_results_table2, pack_years_results_table2) %>%
+  select(-or)
+
+# spread results wide
+results_sp <- adj_results %>%
+  select(variable, gene, p.value) %>%
+  spread(key = variable, value = p.value) %>%
+  mutate()
+
+vars_color = names(results_sp)[-1]
+
+results_sp %>%
+  mutate(gene = toupper(gene)) %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    heading.title.font.size = "small",
+    column_labels.font.size = "small",
+    heading.subtitle.font.size = "small",
+    row.padding = px(1)) %>%
+#  tab_header("") %>%
+  data_color(
+    columns = one_of(vars_color),
+    colors = scales::col_numeric(
+      palette = rev(paletteer::paletteer_d(
+        package = "ggsci",
+        palette = "deep-purple_material"
+        )),
+      domain = c(0, .1))
+  ) %>%
+  fmt_number(columns = one_of(vars_color), 
+             decimals = 3) %>%
+  tab_spanner(
+    label = "LogReg CPD (cat) + Stage",
+    columns = vars(
+      `<= 19 CPD`, 
+      `>= 20 CPD`)) %>%
+  tab_spanner( 
+    label = "LogReg Ever/Never + Stage", 
+    columns = vars(`ever smoked`)) %>%
+  tab_spanner( 
+    label = "LogReg Pack Years + Stage", 
+    columns = vars(`pack years`)) %>%
+  tab_header("P-Values for Smoking Metrics Adjusted for Specimen Stage")
+
+```
+
+
+## Models: TMB ~ Smoking Analysis
+
+- Grouped advanced UTUC with metastatic
+
+```{r }
+first_sample %>%
+  select(tmb, smoking_status_di) %>%
+  na.omit() %>%
+  ggplot(aes(x = smoking_status_di, y = tmb)) +
+  geom_boxplot(aes(fill = smoking_status_di)) +
+  theme_minimal() +
+  xlab("Smoking Status") +
+  ylab("TMB") +
+  ggtitle("TMB Between Smoking Groups") 
+```
+
+```{r}
+
+first_sample_mod <- first_sample %>%
+  mutate(specimen_classification = 
+           fct_collapse(specimen_classification, 
+                    `advanced utuc / metastatic` = c("metastatic", "advanced utuc")))
+
+tmb_mod <- lm(tmb ~ smoking_status + specimen_classification, data = first_sample_mod)
+
+tmb_mod %>%
+  tbl_regression(exponentiate = TRUE, 
+                 label = list(smoking_status = "Smoking Status", 
+                              specimen_classification = "Specimen Stage")) %>%
+  tab_style_bold_labels() %>%
+  tab_style_italicize_levels() %>%
+  tab_style_bold_p() %>%
+  as_gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("TMB ~ Smoking Status + Stage")
+
+```
+
+
+## Models: Smoking Status as Outcome
+
+### Smoking (Ever/Never) ~ Mutations 
+
+```{r}
+
+# select data
+# ALL IMPACT VERSION 8 
+lasso_df <- first_sample %>%
+  select(smoking_status_di, contains("alteration")) %>%
+  mutate_at(vars(contains("alteration")), repl_dots_with_na) %>%
+  mutate_at(vars(contains("alteration")), as.numeric) %>%
+  select(-one_of(under_mut_thresh)) 
+
+x <- map_dbl(lasso_df[,-1], ~sum(is.na(.x)))
+#(x > 100) %>% sum()
+omit_lasso <- x[which(x > 0)] %>% names()
+
+lasso_df <- lasso_df %>%
+  select(-one_of(omit_lasso)) %>%
+  na.omit()
+
+
+```
+- Modelled smoking status as outcome and select genes as variables using Lasso stability selection algorithm.
+- Of all genes over mutation threshold (prev > 9), `r (x > 100) %>% sum()` genes have over 100 missing data points because they were not tested on the impact panel in all versions. The following genes are omitted from the lasso analysis for this reason: 
+
+```{r}
+omit_lasso
+```
+
+- The following genes have selection probabilities > .1. 
+
+```{r original lasso}
+# run lasso mod
+set.seed(11)
+x <- model.matrix(smoking_status_di ~ ., lasso_df)[, -1]
+y <- as.factor(lasso_df$smoking_status_di)
+grid <- 10^seq(10,-2,length=100)
+lasso.mod <- glmnet(x, y, alpha=1,lambda = grid, family = "binomial")
+cv.out=cv.glmnet(x, y, alpha = 1, family = "binomial")
+bestlam = cv.out$lambda.1se
+
+
+# get coefficients
+# lasso.coef = predict(lasso.mod, type="coefficients", s = bestlam)
+# tibble(variable = dimnames(lasso.coef )[[1]], 
+#                 value = matrix(lasso.coef)[,1]) %>%
+#   filter(abs(value) > 0) %>%
+#   mutate(absv = abs(value)) %>%
+#   arrange(desc(absv)) %>%
+#   select(-absv) %>%
+#   gt()   %>%
+#   tab_options(
+#     table.font.size = "small", 
+#     row.padding = px(1))
+
+# as lamba decreases, number of genes selected increases
+
+#nrow(coefs)
+#bestlam
+#plot(lasso.mod)
+```
+
+
+```{r }
+library(stabs)
+library("lars")
+
+set.seed(1)
+fit.stab <- stabsel(x, as.numeric(y), 
+                    fitfun = glmnet.lasso, 
+                    PFER = 1,
+                    cutoff = .7,
+                    sampling.type = "MB")
+
+fit.stab$max %>%
+  enframe(name = "Gene", value = "Selection Probs") %>%
+  arrange(desc(`Selection Probs`)) %>% 
+  filter(`Selection Probs` > .1) %>%
+  separate(Gene, into = c("Gene", NA), sep= "_") %>%
+  gt() %>%
+  tab_options(
+    table.font.size = "small", 
+    row.padding = px(1)) %>%
+  tab_header("Lasso Stability Selection")
+  
+
+```
+

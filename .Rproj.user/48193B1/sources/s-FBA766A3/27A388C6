@@ -1,0 +1,22 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1560176199992.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "0",
+    "id" : "27A388C6",
+    "lastKnownWriteTime" : 1560176932,
+    "last_content_update" : 1560176932988,
+    "path" : "~/Repositories/template/inst/rmarkdown/templates/proj-template/template.yaml",
+    "project_path" : null,
+    "properties" : {
+        "cursorPosition" : "2,17",
+        "scrollLine" : "0"
+    },
+    "relative_order" : 2,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "yaml"
+}
